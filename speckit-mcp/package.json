@@ -1,0 +1,27 @@
+{
+  "name": "speckit-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Spec-Driven Development - Claude as architect, Copilot as developer",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "speckit-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "inspect": "npx @modelcontextprotocol/inspector dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.23.0",
+    "simple-git": "^3.25.0",
+    "glob": "^11.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0"
+  }
+}
