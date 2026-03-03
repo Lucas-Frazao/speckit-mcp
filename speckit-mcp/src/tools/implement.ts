@@ -9,7 +9,7 @@ export function registerImplementTool(server: McpServer): void {
     'speckit_implement',
     {
       description:
-        'Generate a focused implementation brief for the next task (or a specific task). Reads all feature context, updates copilot-instructions.md, and returns a brief that GitHub Copilot can execute. This is the primary bridge between architect and developer.',
+        'Generate a focused implementation brief for the next task (or a specific task). Reads all feature context, updates copilot-instructions.md, and returns a brief that GitHub Copilot can execute. Enforces TDD-first: if the next task is an implementation task and its corresponding test task is not yet complete, the test task is returned instead. This is the primary bridge between architect and developer.',
       inputSchema: {
         featureName: z.string().describe('The feature directory name (e.g. "001-user-auth")'),
         taskId: z
@@ -67,6 +67,16 @@ export function registerImplementTool(server: McpServer): void {
         };
       }
 
+      // ── TDD-First Enforcement ─────────────────────────────────────────────────
+      // If this is an implementation task (not a [TEST] task), check if there are
+      // incomplete [TEST] tasks in the same phase/user story that should be done first.
+      const tddWarning = checkTddPrerequisites(tasks, targetTask, tasksContent);
+
+      if (tddWarning.blockingTestTask) {
+        // Override: force the test task to be done first
+        targetTask = tddWarning.blockingTestTask;
+      }
+
       // Extract tech context from plan
       const techContext = extractTechContextSummary(planContent);
 
@@ -95,6 +105,8 @@ export function registerImplementTool(server: McpServer): void {
       const allRemaining = tasks.filter((t) => !t.completed);
       const nextAfterCurrent = allRemaining.find((t) => t.id !== targetTask!.id);
 
+      const isTestTask = targetTask.description.includes('[TEST]') || tasksContent.match(new RegExp(`\\*\\*${targetTask.id}\\*\\*:.*\\[TEST\\]`));
+
       const implementationBrief = buildImplementationBrief({
         featureName,
         targetTask,
@@ -108,6 +120,8 @@ export function registerImplementTool(server: McpServer): void {
         progress,
         copilotPath,
         nextTask: nextAfterCurrent ?? null,
+        isTestTask: !!isTestTask,
+        tddWarning: tddWarning.message,
       });
 
       return {
@@ -120,6 +134,47 @@ export function registerImplementTool(server: McpServer): void {
       };
     }
   );
+}
+
+// ── TDD Prerequisites Check ───────────────────────────────────────────────────
+
+interface TddCheck {
+  message: string | null;
+  blockingTestTask: ReturnType<typeof parseTaskStatus>[0] | null;
+}
+
+function checkTddPrerequisites(
+  tasks: ReturnType<typeof parseTaskStatus>,
+  targetTask: ReturnType<typeof parseTaskStatus>[0],
+  tasksContent: string
+): TddCheck {
+  // Check if the target task itself is a test task
+  const isTestTask = targetTask.description.includes('[TEST]') ||
+    tasksContent.match(new RegExp(`\\*\\*${targetTask.id}\\*\\*:.*\\[TEST\\]`));
+
+  if (isTestTask) {
+    return { message: null, blockingTestTask: null };
+  }
+
+  // This is an implementation task. Check if there are incomplete test tasks
+  // in the same phase or for the same user story that should be done first.
+  const samePhaseTests = tasks.filter((t) =>
+    !t.completed &&
+    t.id !== targetTask.id &&
+    t.phase === targetTask.phase &&
+    (t.description.includes('[TEST]') ||
+      tasksContent.match(new RegExp(`\\*\\*${t.id}\\*\\*:.*\\[TEST\\]`)))
+  );
+
+  if (samePhaseTests.length > 0) {
+    const firstBlockingTest = samePhaseTests[0];
+    return {
+      message: `⚠️ TDD-FIRST ENFORCEMENT: Implementation task ${targetTask.id} cannot proceed until test task ${firstBlockingTest.id} is complete. Redirecting to the test task.`,
+      blockingTestTask: firstBlockingTest,
+    };
+  }
+
+  return { message: null, blockingTestTask: null };
 }
 
 function extractTechContextSummary(planContent: string | null): {
@@ -177,9 +232,6 @@ function extractAcceptanceCriteriaForTask(specContent: string | null, userStory:
 
 function findTaskDependencies(tasks: ReturnType<typeof parseTaskStatus>, target: typeof tasks[0]): typeof tasks {
   // Find non-parallel tasks in the same phase that come before this task
-  const samePhaseTasks = tasks.filter(
-    (t) => t.phase === target.phase && t.id !== target.id
-  );
   const idx = tasks.findIndex((t) => t.id === target.id);
   return tasks
     .slice(0, idx)
@@ -199,6 +251,8 @@ interface BriefOptions {
   progress: { total: number; completed: number; percentage: number };
   copilotPath: string;
   nextTask: ReturnType<typeof parseTaskStatus>[0] | null;
+  isTestTask: boolean;
+  tddWarning: string | null;
 }
 
 function buildImplementationBrief(opts: BriefOptions): string {
@@ -211,6 +265,8 @@ function buildImplementationBrief(opts: BriefOptions): string {
     progress,
     copilotPath,
     nextTask,
+    isTestTask,
+    tddWarning,
   } = opts;
 
   const lines: string[] = [
@@ -218,13 +274,30 @@ function buildImplementationBrief(opts: BriefOptions): string {
     `Feature: **${featureName}** | Phase: ${targetTask.phase}`,
     `Progress: ${opts.progress.completed}/${opts.progress.total} tasks (${opts.progress.percentage}%)`,
     '',
+  ];
+
+  // TDD warning if redirected
+  if (tddWarning) {
+    lines.push(`> ${tddWarning}`);
+    lines.push('');
+  }
+
+  // Test task indicator
+  if (isTestTask) {
+    lines.push(`## 🧪 TEST TASK (TDD-First)`);
+    lines.push(`This is a **test task**. Write the tests FIRST. These tests define the expected behavior.`);
+    lines.push(`The corresponding implementation task will make these tests pass.`);
+    lines.push('');
+  }
+
+  lines.push(
     `## Task`,
     `**${targetTask.id}**: ${targetTask.description}`,
     targetTask.filePath ? `**Target file**: \`${targetTask.filePath}\`` : '',
     targetTask.userStory ? `**User Story**: ${targetTask.userStory}` : '',
     targetTask.parallel ? '**Parallelizable**: Yes — this task can run concurrently with other [P] tasks' : '',
     '',
-  ];
+  );
 
   if (techContext) {
     lines.push(`## Tech Stack`);
@@ -265,13 +338,30 @@ function buildImplementationBrief(opts: BriefOptions): string {
 
   lines.push(`## For GitHub Copilot`);
   lines.push('The following instructions are now in `.github/copilot-instructions.md`:');
-  lines.push(`1. Implement **${targetTask.id}**: ${targetTask.description}`);
-  if (targetTask.filePath) {
-    lines.push(`2. Create/modify \`${targetTask.filePath}\``);
+
+  if (isTestTask) {
+    lines.push(`1. **WRITE TESTS** for: ${targetTask.description.replace('[TEST]', '').trim()}`);
+    lines.push('2. Tests should define expected behavior before any implementation exists');
+    lines.push('3. Use the testing framework specified in the tech stack');
+    lines.push('4. Cover happy path, edge cases, and error scenarios');
+    lines.push('5. Tests MUST be runnable and initially failing (no implementation yet)');
+  } else {
+    lines.push(`1. Implement **${targetTask.id}**: ${targetTask.description}`);
+    if (targetTask.filePath) {
+      lines.push(`2. Create/modify \`${targetTask.filePath}\``);
+    }
+    lines.push('3. Follow the tech stack and architecture patterns from the plan');
+    lines.push('4. All corresponding tests MUST pass after implementation');
+    lines.push('5. Only touch files in scope of this task');
   }
-  lines.push('3. Follow the tech stack and architecture patterns from the plan');
-  lines.push('4. Write tests if the constitution requires it');
-  lines.push('5. Only touch files in scope of this task');
+
+  lines.push('');
+
+  // Mandatory rules
+  lines.push(`## Mandatory Rules`);
+  lines.push('- **YAGNI**: Build ONLY what this task requires. No speculative code.');
+  lines.push('- **Modularity**: Keep functions small, single-purpose, loosely coupled.');
+  lines.push('- **Clarification**: If ANYTHING is ambiguous, STOP and ask the user. Do NOT assume.');
   lines.push('');
 
   lines.push(`## After Implementation`);

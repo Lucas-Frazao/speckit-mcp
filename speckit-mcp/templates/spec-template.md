@@ -49,10 +49,27 @@ Input: User description: "$ARGUMENTS"
 - **FR-002**: System MUST [specific capability]
 - **FR-003**: Users MUST be able to [key interaction]
 
+### Non-Functional Requirements
+
+- **NFR-001**: [Performance/security/scalability requirement]
+
 ### Key Entities (include if feature involves data)
 
 - **[Entity 1]**: [What it represents, key attributes without implementation]
 - **[Entity 2]**: [What it represents, relationships to other entities]
+
+## Modularity Requirements (mandatory)
+
+- Each concern MUST be in its own module (e.g., validation, business logic, data access, presentation)
+- Modules MUST communicate through explicit interfaces, not shared state
+- No single file should handle more than one responsibility
+
+## YAGNI Checklist (mandatory)
+
+- [ ] Every requirement maps to a specific user story
+- [ ] No speculative features or "nice to haves" are included
+- [ ] No abstract infrastructure is planned beyond what is needed for the listed requirements
+- [ ] Success criteria are concrete and testable, not aspirational
 
 ## Success Criteria (mandatory)
 
@@ -60,3 +77,11 @@ Input: User description: "$ARGUMENTS"
 
 - **SC-001**: [Measurable metric]
 - **SC-002**: [Measurable metric]
+
+## Open Questions
+
+> List any ambiguities here. These MUST be resolved via `speckit_clarify` before planning.
+> Do NOT guess or assume answers to these questions.
+
+- [Question about ambiguous requirement]
+- [Question about edge case behavior]

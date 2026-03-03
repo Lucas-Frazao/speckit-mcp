@@ -1,7 +1,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { readSpecFile, getFeatureDir, fileExists } from '../lib/filesystem.js';
+import { readSpecFile, getFeatureDir, fileExists, readConstitution } from '../lib/filesystem.js';
 import { parseTaskStatus } from '../lib/utils.js';
+import { validateConstitutionHasMandatoryPrinciples } from '../lib/constitution-enforcer.js';
 import type { AnalysisIssue, AnalysisResult } from '../types.js';
 
 export function registerAnalyzeTool(server: McpServer): void {
@@ -9,7 +10,7 @@ export function registerAnalyzeTool(server: McpServer): void {
     'speckit_analyze',
     {
       description:
-        'Quality gate for a feature. Reads spec.md, plan.md, and tasks.md and checks for unfilled placeholders, missing sections, [NEEDS CLARIFICATION] markers, incomplete tasks, and missing user story coverage. Returns a structured analysis with issues and a needsRevision flag. Run after speckit_tasks and after implementation to decide whether to re-run a phase.',
+        'Quality gate for a feature. Reads spec.md, plan.md, and tasks.md and checks for unfilled placeholders, missing sections, [NEEDS CLARIFICATION] markers, incomplete tasks, TDD ordering violations, YAGNI violations, modularity issues, and missing user story coverage. Returns a structured analysis with issues and a needsRevision flag. Run after speckit_tasks and after implementation to decide whether to re-run a phase.',
       inputSchema: {
         featureName: z.string().describe('The feature directory name (e.g. "001-user-auth")'),
       },
@@ -31,8 +32,29 @@ export function registerAnalyzeTool(server: McpServer): void {
       const specContent = await readSpecFile(featureName, 'spec.md');
       const planContent = await readSpecFile(featureName, 'plan.md');
       const tasksContent = await readSpecFile(featureName, 'tasks.md');
+      const constitutionContent = await readConstitution();
 
       const issues: AnalysisIssue[] = [];
+
+      // ── Constitution validation ─────────────────────────────────────────────────
+      if (constitutionContent) {
+        const missingPrinciples = validateConstitutionHasMandatoryPrinciples(constitutionContent);
+        if (missingPrinciples.length > 0) {
+          issues.push({
+            severity: 'critical',
+            message: `Constitution is missing mandatory principles: ${missingPrinciples.join(', ')}`,
+            file: 'constitution.md',
+            fix: 'Run speckit_constitution to regenerate the constitution with mandatory principles.',
+          });
+        }
+      } else {
+        issues.push({
+          severity: 'critical',
+          message: 'No constitution found. Every project must have a constitution with mandatory principles.',
+          file: 'constitution.md',
+          fix: 'Run speckit_init or speckit_constitution to create the constitution.',
+        });
+      }
 
       // Analyze spec.md
       if (!specContent) {
@@ -69,10 +91,21 @@ export function registerAnalyzeTool(server: McpServer): void {
       } else {
         analyzeTasksFile(tasksContent, issues);
 
+        // TDD ordering check
+        checkTddOrdering(tasksContent, issues);
+
+        // YAGNI check
+        checkYagniCompliance(tasksContent, specContent, issues);
+
         // Cross-check: user stories in spec vs phases in tasks
         if (specContent) {
           crossCheckUserStoryCoverage(specContent, tasksContent, issues);
         }
+      }
+
+      // Modularity check on plan
+      if (planContent) {
+        checkModularityCompliance(planContent, issues);
       }
 
       // Determine if revision is needed
@@ -177,6 +210,16 @@ function analyzePlanFile(content: string, issues: AnalysisIssue[]): void {
       }
     }
   }
+
+  // Check for testing framework specification
+  if (!content.toLowerCase().includes('testing')) {
+    issues.push({
+      severity: 'warning',
+      message: 'plan.md does not specify a testing framework — required for TDD-first workflow',
+      file: 'plan.md',
+      fix: 'Add a Testing field to Technical Context (e.g., vitest, jest, pytest)',
+    });
+  }
 }
 
 // ── Tasks analysis ─────────────────────────────────────────────────────────────
@@ -217,6 +260,128 @@ function analyzeTasksFile(content: string, issues: AnalysisIssue[]): void {
       fix: `Run speckit_implement to get the next task, then implement it`,
     });
   }
+
+  // Check for test setup task in Phase 1
+  if (!content.includes('test framework') && !content.includes('test configuration') && !content.includes('Setup test')) {
+    issues.push({
+      severity: 'warning',
+      message: 'tasks.md Phase 1 does not include a test framework setup task',
+      file: 'tasks.md',
+      fix: 'Add a test framework setup task to Phase 1 (required for TDD-first workflow)',
+    });
+  }
+}
+
+// ── TDD Ordering Check ────────────────────────────────────────────────────────
+
+function checkTddOrdering(content: string, issues: AnalysisIssue[]): void {
+  // Check that [TEST] tasks appear before non-test tasks in each phase
+  const phases = content.split(/## Phase \d+/);
+  for (const phase of phases) {
+    if (!phase.trim()) continue;
+
+    const taskLines = phase.match(/- \[[ x]\] \*\*T\d{3}\*\*:.*$/gm) ?? [];
+    let lastTestIndex = -1;
+    let firstImplIndex = -1;
+
+    for (let i = 0; i < taskLines.length; i++) {
+      const line = taskLines[i];
+      if (line.includes('[TEST]')) {
+        lastTestIndex = i;
+        if (firstImplIndex !== -1 && firstImplIndex < i) {
+          // Found a test task AFTER an implementation task in the same phase
+          issues.push({
+            severity: 'critical',
+            message: `TDD violation: Test task found after implementation task in same phase. Test tasks must come first.`,
+            file: 'tasks.md',
+            fix: 'Reorder tasks so all [TEST] tasks appear before implementation tasks within each phase',
+          });
+          return; // One issue per file is enough
+        }
+      } else if (!line.includes('Setup test') && !line.includes('Create project') && !line.includes('Initialize project')) {
+        if (firstImplIndex === -1) firstImplIndex = i;
+      }
+    }
+  }
+
+  // Check that [TEST] tasks exist at all
+  if (!content.includes('[TEST]')) {
+    issues.push({
+      severity: 'critical',
+      message: 'tasks.md has no [TEST] tasks — TDD-first requires test tasks before implementation',
+      file: 'tasks.md',
+      fix: 'Re-run speckit_tasks to regenerate with [TEST] tasks, or manually add test tasks before each implementation task',
+    });
+  }
+}
+
+// ── YAGNI Compliance ──────────────────────────────────────────────────────────
+
+function checkYagniCompliance(
+  tasksContent: string,
+  specContent: string | null,
+  issues: AnalysisIssue[]
+): void {
+  if (!specContent) return;
+
+  // Check for common YAGNI violations in tasks
+  const yagniPatterns = [
+    { pattern: /abstract.*factory/i, label: 'abstract factory pattern' },
+    { pattern: /generic.*util/i, label: 'generic utility' },
+    { pattern: /future.*proof/i, label: 'future-proofing' },
+    { pattern: /plugin.*system/i, label: 'plugin system' },
+    { pattern: /extensib/i, label: 'extensibility layer' },
+  ];
+
+  for (const { pattern, label } of yagniPatterns) {
+    if (pattern.test(tasksContent)) {
+      issues.push({
+        severity: 'warning',
+        message: `Potential YAGNI violation: tasks.md references "${label}" — verify this is required by a specific spec requirement`,
+        file: 'tasks.md',
+        fix: `Check if "${label}" is directly required by a Functional Requirement (FR-XXX) in spec.md. If not, remove it.`,
+      });
+    }
+  }
+}
+
+// ── Modularity Compliance ─────────────────────────────────────────────────────
+
+function checkModularityCompliance(planContent: string, issues: AnalysisIssue[]): void {
+  // Check for signs of monolithic design
+  const monolithicPatterns = [
+    { pattern: /single.*file.*application/i, label: 'single-file application' },
+    { pattern: /monolith/i, label: 'monolithic design' },
+    { pattern: /god.*class/i, label: 'god class' },
+    { pattern: /all.*in.*one/i, label: 'all-in-one module' },
+  ];
+
+  for (const { pattern, label } of monolithicPatterns) {
+    if (pattern.test(planContent)) {
+      issues.push({
+        severity: 'warning',
+        message: `Potential modularity violation: plan.md references "${label}"`,
+        file: 'plan.md',
+        fix: `Refactor to use modular architecture: separate concerns into distinct modules with single responsibilities.`,
+      });
+    }
+  }
+
+  // Check that project structure has multiple directories (sign of modularity)
+  if (planContent.includes('## Project Structure')) {
+    const structMatch = planContent.match(/## Project Structure\n([\s\S]*?)(?=\n## |$)/);
+    if (structMatch) {
+      const srcDirs = (structMatch[1].match(/src\//g) ?? []).length;
+      if (srcDirs < 2) {
+        issues.push({
+          severity: 'info',
+          message: 'Project structure has fewer than 2 src/ subdirectories — consider splitting into modules',
+          file: 'plan.md',
+          fix: 'Organize code into separate directories by concern (e.g., src/models/, src/services/, src/routes/)',
+        });
+      }
+    }
+  }
 }
 
 // ── Cross-checks ───────────────────────────────────────────────────────────────
@@ -251,6 +416,20 @@ function crossCheckUserStoryCoverage(
         message: `User story ${story} from spec.md has no corresponding tasks in tasks.md`,
         file: 'tasks.md',
         fix: `Add tasks tagged [${story}] for the ${story} user story in tasks.md`,
+      });
+    }
+  }
+
+  // Check that each user story has both [TEST] and implementation tasks
+  for (const story of taskStories) {
+    const storyTasks = tasksContent.match(new RegExp(`\\[${story}\\]`, 'g')) ?? [];
+    const storyTestTasks = tasksContent.match(new RegExp(`\\[TEST\\].*\\[${story}\\]|\\[${story}\\].*\\[TEST\\]`, 'g')) ?? [];
+    if (storyTasks.length > 0 && storyTestTasks.length === 0) {
+      issues.push({
+        severity: 'critical',
+        message: `User story ${story} has implementation tasks but NO test tasks — TDD-first violation`,
+        file: 'tasks.md',
+        fix: `Add [TEST] tasks for ${story} BEFORE its implementation tasks`,
       });
     }
   }
@@ -307,7 +486,7 @@ function buildAnalysisSummary(
   const infos = issues.filter((i) => i.severity === 'info').length;
 
   if (!needsRevision && infos === 0) {
-    return `Feature "${featureName}" passed all quality checks — ready to implement.`;
+    return `Feature "${featureName}" passed all quality checks (including TDD, YAGNI, modularity) — ready to implement.`;
   }
   if (!needsRevision) {
     return `Feature "${featureName}" has ${infos} informational note(s) but is ready to proceed.`;

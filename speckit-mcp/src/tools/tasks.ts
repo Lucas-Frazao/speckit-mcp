@@ -9,7 +9,7 @@ export function registerTasksTool(server: McpServer): void {
     'speckit_tasks',
     {
       description:
-        'Generate a structured task breakdown from a feature plan. Reads spec.md, plan.md, and data-model.md to produce tasks.md with phased tasks, parallel markers, user story labels, and checkpoints.',
+        'Generate a structured task breakdown from a feature plan. Reads spec.md, plan.md, and data-model.md to produce tasks.md with phased tasks, parallel markers, user story labels, and checkpoints. IMPORTANT: Test tasks are always generated BEFORE their corresponding implementation tasks (TDD-first enforcement).',
       inputSchema: {
         featureName: z.string().describe('The feature directory name (e.g. "001-user-auth")'),
       },
@@ -58,6 +58,8 @@ export function registerTasksTool(server: McpServer): void {
 
 **File:** ${tasksFilePath}
 
+**TDD-First Enforcement:** Test tasks are generated BEFORE implementation tasks in every phase.
+
 ---
 
 ${tasksContent}
@@ -66,10 +68,12 @@ ${tasksContent}
 
 **Instructions for Claude (architect):**
 1. Review each task — are the file paths realistic for this project?
-2. Verify phase ordering — Phase 2 should block all user story phases
-3. Check parallel markers [P] — ensure no circular dependencies
-4. Add or refine tasks based on architecture decisions in plan.md
-5. Once satisfied, run \`speckit_implement\` to get the first task for Copilot`,
+2. Verify TDD ordering — every implementation task MUST have a preceding test task
+3. Verify phase ordering — Phase 2 should block all user story phases
+4. Check parallel markers [P] — ensure no circular dependencies
+5. Add or refine tasks based on architecture decisions in plan.md
+6. Check YAGNI — remove any tasks that build speculative/unused infrastructure
+7. Once satisfied, run \`speckit_implement\` to get the first task for Copilot`,
           },
         ],
       };
@@ -162,6 +166,9 @@ function buildTasksContent(
     ? 'go'
     : 'ts';
 
+  const testExt = ext === 'py' ? 'py' : `test.${ext}`;
+  const testDir = ext === 'py' ? 'tests/' : 'tests/';
+
   const storage = techContext.storage ?? '';
   const hasDb =
     storage.toLowerCase().includes('postgres') ||
@@ -189,68 +196,92 @@ Prerequisites: plan.md (required), spec.md (required)
 
 - **[P]**: Can run in parallel (different files, no dependencies)
 - **[Story]**: Which user story (e.g., US1, US2)
+- **[TEST]**: Test task — MUST be completed before its corresponding implementation task
 - Include exact file paths in descriptions
+
+## TDD Rule
+
+> **Tests FIRST, implementation SECOND.** Every implementation task has a preceding test task.
+> The test task defines the expected behavior; the implementation task makes it pass.
+> No implementation task may begin until its test task is marked complete.
 
 ---`);
 
   // Phase 1: Setup
   sections.push(`
 ## Phase 1: Setup (Shared Infrastructure)
-**Purpose**: Project initialization and basic structure
+**Purpose**: Project initialization, basic structure, and test infrastructure
 
 - [ ] **T${pad(taskCounter++)}**: Create project directory structure per plan.md
-- [ ] **T${pad(taskCounter++)}**: Initialize project dependencies and configuration files`);
+- [ ] **T${pad(taskCounter++)}**: Initialize project dependencies and configuration files
+- [ ] **T${pad(taskCounter++)}**: Setup test framework and test configuration (${techContext.testing ?? 'vitest/jest/pytest'})`);
 
   // Phase 2: Foundation
   let phase2Lines: string[] = [
     `\n## Phase 2: Foundational (Blocking Prerequisites)`,
     `**Purpose**: Core infrastructure that MUST complete before user stories`,
+    `**TDD Rule**: Write tests for each foundational component BEFORE implementing it`,
     `⚠️ No user story work until this phase is complete`,
     ``,
   ];
 
   if (hasDb) {
+    phase2Lines.push(`- [ ] **T${pad(taskCounter++)}**: [TEST] Write tests for database connection and schema in ${testDir}db.${testExt}`);
     phase2Lines.push(`- [ ] **T${pad(taskCounter++)}**: Setup database schema and migrations in db/migrations/`);
-    phase2Lines.push(`- [ ] **T${pad(taskCounter++)}**: [P] Create database connection and pool setup in src/db/connection.${ext}`);
+    phase2Lines.push(`- [ ] **T${pad(taskCounter++)}**: [P] Implement database connection and pool setup in src/db/connection.${ext}`);
   }
 
   if (isApi) {
+    phase2Lines.push(`- [ ] **T${pad(taskCounter++)}**: [TEST] Write tests for API routing and error handling in ${testDir}api.${testExt}`);
     phase2Lines.push(`- [ ] **T${pad(taskCounter++)}**: [P] Setup API routing and middleware in src/routes/index.${ext}`);
     phase2Lines.push(`- [ ] **T${pad(taskCounter++)}**: [P] Configure error handling and response utilities in src/lib/errors.${ext}`);
   }
 
   if (hasEntities) {
+    phase2Lines.push(`- [ ] **T${pad(taskCounter++)}**: [TEST] Write tests for type validation in ${testDir}types.${testExt}`);
     phase2Lines.push(`- [ ] **T${pad(taskCounter++)}**: [P] Define ${ext === 'py' ? 'models' : 'types'} and interfaces in src/types/index.${ext}`);
   }
 
-  phase2Lines.push(`\n**Checkpoint**: Foundation ready`);
+  phase2Lines.push(`\n**Checkpoint**: Foundation ready — all foundation tests passing`);
   sections.push(phase2Lines.join('\n'));
 
-  // Phase per user story
+  // Phase per user story — TDD-first ordering
   for (const story of userStories) {
     const usLabel = `US${story.number}`;
+    const storySlug = story.title.toLowerCase().replace(/\s+/g, '-');
     const storyLines: string[] = [
       `\n## Phase ${2 + story.number}: User Story ${story.number} - ${story.title} (${story.priority})`,
       `**Goal**: ${story.description || 'Implement ' + story.title}`,
       `**Independent Test**: ${story.independentTest}`,
+      `**TDD Rule**: All test tasks in this phase MUST complete before their implementation counterparts`,
       ``,
-      `### Implementation`,
+      `### Tests First`,
     ];
 
+    // Test tasks FIRST
     if (hasEntities) {
-      storyLines.push(`- [ ] **T${pad(taskCounter++)}**: [P] [${usLabel}] Implement data model/repository in src/models/${story.title.toLowerCase().replace(/\s+/g, '-')}.${ext}`);
+      storyLines.push(`- [ ] **T${pad(taskCounter++)}**: [TEST] [P] [${usLabel}] Write tests for data model/repository in ${testDir}${storySlug}-model.${testExt}`);
     }
-
-    storyLines.push(`- [ ] **T${pad(taskCounter++)}**: [${usLabel}] Implement core service logic in src/services/${story.title.toLowerCase().replace(/\s+/g, '-')}-service.${ext}`);
-
+    storyLines.push(`- [ ] **T${pad(taskCounter++)}**: [TEST] [${usLabel}] Write tests for core service logic in ${testDir}${storySlug}-service.${testExt}`);
     if (isApi) {
-      storyLines.push(`- [ ] **T${pad(taskCounter++)}**: [${usLabel}] Implement API endpoint/handler in src/routes/${story.title.toLowerCase().replace(/\s+/g, '-')}.${ext}`);
+      storyLines.push(`- [ ] **T${pad(taskCounter++)}**: [TEST] [${usLabel}] Write tests for API endpoint/handler in ${testDir}${storySlug}-api.${testExt}`);
     }
+    storyLines.push(`- [ ] **T${pad(taskCounter++)}**: [TEST] [P] [${usLabel}] Write tests for input validation and edge cases in ${testDir}${storySlug}-validation.${testExt}`);
 
+    storyLines.push('');
+    storyLines.push(`### Implementation (only after tests above are complete)`);
+
+    // Implementation tasks SECOND
+    if (hasEntities) {
+      storyLines.push(`- [ ] **T${pad(taskCounter++)}**: [P] [${usLabel}] Implement data model/repository in src/models/${storySlug}.${ext}`);
+    }
+    storyLines.push(`- [ ] **T${pad(taskCounter++)}**: [${usLabel}] Implement core service logic in src/services/${storySlug}-service.${ext}`);
+    if (isApi) {
+      storyLines.push(`- [ ] **T${pad(taskCounter++)}**: [${usLabel}] Implement API endpoint/handler in src/routes/${storySlug}.${ext}`);
+    }
     storyLines.push(`- [ ] **T${pad(taskCounter++)}**: [P] [${usLabel}] Add input validation and error handling`);
-    storyLines.push(`- [ ] **T${pad(taskCounter++)}**: [P] [${usLabel}] Write unit tests in tests/${story.title.toLowerCase().replace(/\s+/g, '-')}.test.${ext}`);
 
-    storyLines.push(`\n**Checkpoint**: User Story ${story.number} functional`);
+    storyLines.push(`\n**Checkpoint**: User Story ${story.number} — all tests passing, implementation complete`);
     sections.push(storyLines.join('\n'));
   }
 
@@ -259,14 +290,19 @@ Prerequisites: plan.md (required), spec.md (required)
     sections.push(`
 ## Phase 3: Core Feature Implementation
 **Goal**: Implement the primary feature functionality
+**TDD Rule**: All test tasks MUST complete before their implementation counterparts
 
-### Implementation
+### Tests First
+- [ ] **T${pad(taskCounter++)}**: [TEST] Write tests for core business logic in ${testDir}core.${testExt}
+- [ ] **T${pad(taskCounter++)}**: [TEST] [P] Write tests for interface/endpoint in ${testDir}api.${testExt}
+- [ ] **T${pad(taskCounter++)}**: [TEST] [P] Write tests for validation and edge cases in ${testDir}validation.${testExt}
+
+### Implementation (only after tests above are complete)
 - [ ] **T${pad(taskCounter++)}**: Implement core business logic in src/services/
 - [ ] **T${pad(taskCounter++)}**: [P] Implement interface/endpoint in src/routes/ or src/cli/
 - [ ] **T${pad(taskCounter++)}**: [P] Add validation and error handling
-- [ ] **T${pad(taskCounter++)}**: [P] Write tests
 
-**Checkpoint**: Feature functional`);
+**Checkpoint**: Feature functional — all tests passing`);
   }
 
   // Dependencies section
@@ -277,7 +313,19 @@ Prerequisites: plan.md (required), spec.md (required)
 
 - Phase 1 → Phase 2 → Phase 3+
 - User stories can proceed in parallel after Phase 2
-- Tasks marked [P] can run concurrently within their phase`);
+- Tasks marked [P] can run concurrently within their phase
+- **TDD RULE: [TEST] tasks MUST complete before their corresponding implementation tasks**
+- Within each phase, the test subsection blocks the implementation subsection`);
+
+  // YAGNI reminder
+  sections.push(`
+## YAGNI Check
+
+Before implementing any task, verify:
+- [ ] This task is directly required by a spec requirement (FR-XXX or SC-XXX)
+- [ ] No speculative abstractions or "future-proofing" is included
+- [ ] No unused utility functions, helper classes, or config options are created
+- [ ] The implementation is the simplest thing that could possibly work`);
 
   return sections.join('\n');
 }
